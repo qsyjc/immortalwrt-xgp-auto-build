@@ -1,336 +1,222 @@
-#!/usr/bin/env bash
-set -Eeuo pipefail
-
-# build-immortalwrt.sh
-# 用途：准备 files/（首启脚本、udev 热插、qmodem/mwan3 watcher、版本信息等），更新 feeds、拉插件、编译 ImmortalWrt。
-# 兼容本地和 GitHub Actions（会把日志输出到文件）。
-
-WORKDIR="$(pwd)"
-IW_DIR="$WORKDIR/immortalwrt"
-LOG_FILE="$WORKDIR/immortalwrt-build.log"
-NPROC=$(nproc || echo 2)
-
-exec > >(tee -a "$LOG_FILE") 2>&1
-
-echo "🚀 ImmortalWrt Auto Build (full pipeline)"
-echo "📁 Workdir: $WORKDIR"
-echo "🧾 Log: $LOG_FILE"
-
-# ---- clone / update (auto-stash safe) ----
-if [ ! -d "$IW_DIR/.git" ]; then
-  echo "[+] Clone ImmortalWrt"
-  git clone https://github.com/immortalwrt/immortalwrt.git "$IW_DIR"
-fi
-cd "$IW_DIR"
-
-if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
-  echo "[!] Local changes detected in immortalwrt, auto-stash"
-  git stash push -u -m "auto-stash-before-build" >/dev/null || true
-fi
-git pull --rebase || git pull || true
-
-# ---- ensure feeds helper is executable ----
-if [ -f "./scripts/feeds" ]; then
-  chmod +x ./scripts/feeds || true
-fi
-
-# ---- ensure feeds + qmodem feed present ----
-grep -q "^src-git qmodem " feeds.conf.default 2>/dev/null || \
-  echo "src-git qmodem https://github.com/FUjr/QModem.git;main" >> feeds.conf.default
-
-echo "[+] Update and install all feeds"
-./scripts/feeds update -a
-./scripts/feeds install -a
-
-echo "[+] Update/install QModem feed"
-./scripts/feeds update qmodem || true
-./scripts/feeds install -a -p qmodem || true
-./scripts/feeds install -a -f -p qmodem || true
-
-# ---- enforce odhcpd / odhcp6c specific versions to avoid qmodem ipv6 breakage ----
-fix_makefile() {
-  local file="$1" date="$2" ver="$3" hash="$4"
-  if [ -f "$file" ]; then
-    echo "[*] Ensuring $file uses pinned version"
-    sed -i "s/^PKG_SOURCE_DATE:=.*/PKG_SOURCE_DATE:=${date}/" "$file" || true
-    sed -i "s/^PKG_SOURCE_VERSION:=.*/PKG_SOURCE_VERSION:=${ver}/" "$file" || true
-    sed -i "s/^PKG_MIRROR_HASH:=.*/PKG_MIRROR_HASH:=${hash}/" "$file" || true
-  fi
-}
-
-fix_makefile package/network/services/odhcpd/Makefile \
-  2025-10-26 \
-  fc27940fe9939f99aeb988d021c7edfa54460123 \
-  acb086731fd7d072ddddc1d5f3bad9377e89a05597ce004d24bd0cdb60586f0a
-
-fix_makefile package/network/ipv6/odhcp6c/Makefile \
-  2025-10-21 \
-  77e1ae21e67f81840024ffe5bb7cf69a8fb0d2f0 \
-  78f1c2342330da5f6bf08a4be89df1d771661966bbff13bd15462035de46837b
-
-# ---- screen driver packages (clone or update) ----
-mkdir -p package/zz
-clone_or_update() {
-  local url="$1" dir="$2"
-  if [ -d "$dir/.git" ]; then
-    echo "[=] update $dir"
-    git -C "$dir" pull --ff-only || true
-  else
-    echo "[+] clone $dir"
-    git clone "$url" "$dir" || true
-  fi
-}
-clone_or_update https://github.com/zzzz0317/kmod-fb-tft-gc9307.git package/zz/kmod-fb-tft-gc9307
-clone_or_update https://github.com/zzzz0317/xgp-v3-screen.git        package/zz/xgp-v3-screen
-
-# ---- prepare files/ (firstboot scripts, udev, hotplug, watcher, keep list) ----
-FILES_DIR="$IW_DIR/files"
-mkdir -p "$FILES_DIR/etc" \
-         "$FILES_DIR/etc/config" \
-         "$FILES_DIR/etc/uci-defaults" \
-         "$FILES_DIR/etc/udev/rules.d" \
-         "$FILES_DIR/etc/init.d" \
-         "$FILES_DIR/lib/upgrade/keep.d"
-
-### 1) version info and build id (will be included in image)
-BUILD_UUID=$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid)
-BUILD_DATE="$(date '+%Y-%m-%d %H:%M:%S %z')"
-BUILD_REVISION="R$(date +%y).$(date +%-m).$(date +%-d).$(date +%-H)"
-IMMORTAL_HASH="$(git rev-parse --short HEAD || true)"
-REPO_HASH="$(git rev-parse --short HEAD || true)"
-cat > "$FILES_DIR/etc/uci-defaults/zzzz-version" <<EOF
-#!/bin/sh
-echo "DISTRIB_REVISION='${BUILD_REVISION}'" >> /etc/openwrt_release
-/bin/sync
-exit 0
-EOF
-chmod +x "$FILES_DIR/etc/uci-defaults/zzzz-version"
-
-cat > "$FILES_DIR/etc/zz_build_id" <<EOF
-ZZ_BUILD_UUID='${BUILD_UUID}'
-ZZ_BUILD_DATE='${BUILD_DATE}'
-ZZ_BUILD_REVISION='${BUILD_REVISION}'
-ZZ_BUILD_IMMORTAL_HASH='${IMMORTAL_HASH}'
-ZZ_BUILD_REPO_HASH='${REPO_HASH}'
-ZZ_BUILD_HOST='$(hostname)'
-ZZ_BUILD_USER='builder'
-EOF
-
-# ---- keep qmodem config across sysupgrade ----
-echo "etc/config/qmodem" > "$FILES_DIR/lib/upgrade/keep.d/zz-qmodem"
-# also ensure sysupgrade.conf entry for old systems
-echo "/etc/config/qmodem" >> "$FILES_DIR/etc/sysupgrade.conf" || true
-
-# ---- qmodem default config copy (if exists in feed) ----
-if [ -f "feeds/qmodem/application/qmodem/files/etc/config/qmodem" ]; then
-  cp -f feeds/qmodem/application/qmodem/files/etc/config/qmodem "$FILES_DIR/etc/config/qmodem"
-else
-  # create a minimal placeholder
-  cat > "$FILES_DIR/etc/config/qmodem" <<EOF
-config global 'global'
-	option keep_config '1'
-EOF
-fi
-
-# ---- firstboot: LAN / WiFi / UI / qmodem setup (uci-defaults) ----
-cat > "$FILES_DIR/etc/uci-defaults/99-firstboot-xgp" <<'EOF'
-#!/bin/sh
-# firstboot initialization - run once
-uci set system.@system[0].hostname='zzXGP'
-uci commit system
-
-uci set network.lan.ipaddr='10.0.11.1'
-uci commit network
-
-# set luci defaults
-uci set luci.main.lang='zh_cn'
-uci set luci.main.mediaurlbase='/luci-static/argon'
-uci commit luci
-
-# Basic wifi auto-config: set country US and create ifaces for available radios
-SSID_BASE='zzXGP'
-WIFI_KEY='xgpxgpxgp'
-idx=0
-for r in $(uci show wireless 2>/dev/null | grep "=wifi-device" | cut -d. -f2); do
-  uci set wireless.$r.country='US'
-  # create iface if not exist referencing this radio
-  iface=$(uci show wireless 2>/dev/null | grep "\.$r" | grep -o "wifi-iface\\[[0-9]*\\]" | head -n1 | sed 's/\\[//;s/\\]//;s/wifi-iface/wifi-iface/' || true)
-  # fallback: add one
-  uci add wireless wifi-iface >/dev/null 2>&1 || true
-  # find last iface index
-  last=$(uci show wireless | tail -n1 | cut -d. -f2)
-  uci rename wireless."$last" "default_$r" 2>/dev/null || true
-  uci set wireless.default_$r.device="$r"
-  uci set wireless.default_$r.mode='ap'
-  uci set wireless.default_$r.network='lan'
-  uci set wireless.default_$r.ssid="${SSID_BASE}_${idx}"
-  uci set wireless.default_$r.encryption='psk2+ccmp'
-  uci set wireless.default_$r.key="$WIFI_KEY"
-  idx=$((idx+1))
-done
-uci commit wireless
-# mark firstboot done (if zz_config exists)
-uci -q set zz_config.@status[0].first_boot=0
-uci commit zz_config 2>/dev/null || true
-
-exit 0
-EOF
-chmod +x "$FILES_DIR/etc/uci-defaults/99-firstboot-xgp"
-
-# ---- udev rules to call hotplug script for USB/PCI modems ----
-cat > "$FILES_DIR/etc/udev/rules.d/99-qmodem-hotplug.rules" <<'EOF'
-# run qmodem-hotplug script on add/remove of USB devices
-SUBSYSTEM=="usb", ACTION=="add", RUN+="/etc/qmodem-hotplug.sh add %p"
-SUBSYSTEM=="usb", ACTION=="remove", RUN+="/etc/qmodem-hotplug.sh remove %p"
-# NOTE: PCI hotplug environment in OpenWrt/ImmortalWrt differs; we also support hotplug.d handlers
-EOF
-
-# ---- hotplug handler script (packaged into image, executed by udev on device) ----
-cat > "$FILES_DIR/etc/qmodem-hotplug.sh" <<'EOF'
-#!/bin/sh
-# /etc/qmodem-hotplug.sh <add|remove> <devpath>
-action=$1
-devpath=$2
-
-logger -t qmodem-hotplug "action=$action devpath=$devpath"
-
-if [ "$action" = "add" ]; then
-  # ensure qmodem config exists
-  [ -f /etc/config/qmodem ] || { logger -t qmodem-hotplug "no qmodem config"; exit 0; }
-  # register a modem-slot entry (if not exists with same slot)
-  # Use slot name based on devpath basename (e.g., 8-1)
-  slotname=$(basename "$devpath")
-  # check if any slot already uses same slot
-  uci show qmodem | grep -q "slot='$slotname'" && exit 0
-  # create a new slot
-  uci add qmodem modem-slot
-  idx=$(uci show qmodem | tail -n1 | cut -d. -f2)
-  uci set qmodem.$idx.type='usb'
-  uci set qmodem.$idx.slot="$slotname"
-  uci set qmodem.$idx.alias="wwan_$slotname"
-  uci set qmodem.$idx.net_led='blue:net'
-  uci commit qmodem
-  # add network interface for mwan3
-  if ! uci -q get network."wwan_$slotname" >/dev/null; then
-    uci set network."wwan_$slotname"=interface
-    uci set network."wwan_$slotname".proto='dhcp'
-    uci set network."wwan_$slotname".enabled='1'
-    uci commit network
-  fi
-  # restart qmodem service to pick up
-  /etc/init.d/qmodem restart 2>/dev/null || true
-  # reload network/mwan3
-  /etc/init.d/network restart 2>/dev/null || true
-  /etc/init.d/mwan3 restart 2>/dev/null || true
-elif [ "$action" = "remove" ]; then
-  # best-effort: do nothing destructive; user can clean config
-  exit 0
-fi
-EOF
-chmod +x "$FILES_DIR/etc/qmodem-hotplug.sh"
-
-# ---- simple watcher service: check modem link quality and adjust mwan3 policy ----
-# This will be packaged as /etc/init.d/qmodem-mwan-watchdog on device (lightweight)
-cat > "$FILES_DIR/etc/init.d/qmodem-mwan-watchdog" <<'EOF'
-#!/bin/sh /etc/rc.common
-# Simple watchdog to monitor qmodem interfaces and adjust mwan3 policy
-START=99
-STOP=10
-
-boot() {
-  # run background task
-  qmodem_mwan_watchdog &
-}
-
-qmodem_mwan_watchdog() {
-  while true; do
-    # list interfaces from qmodem config
-    for s in $(uci show qmodem 2>/dev/null | cut -d. -f2 | sort -u); do
-      # check if section is modem-slot by checking type
-      t=$(uci -q get qmodem.$s.type)
-      [ -z "$t" ] && continue
-      # build interface name heuristic: wwan_<slot> or alias
-      alias=$(uci -q get qmodem.$s.alias)
-      slot=$(uci -q get qmodem.$s.slot)
-      if [ -n "$alias" ]; then
-        iface="$alias"
-      elif [ -n "$slot" ]; then
-        iface="wwan_$slot"
-      else
-        continue
-      fi
-      # check if interface exists and has IP
-      if ip link show "$iface" >/dev/null 2>&1; then
-        # ping test via the interface (best-effort)
-        if ping -I "$iface" -c 2 -W 2 1.1.1.1 >/dev/null 2>&1; then
-          # mark interface up in mwan3 (create if needed)
-          if ! uci -q get mwan3."$iface" >/dev/null; then
-            uci set mwan3."$iface"='interface'
-            uci set mwan3."$iface".enabled='1'
-            uci set mwan3."$iface".proto='static' 2>/dev/null || true
-            uci commit mwan3
-            /etc/init.d/mwan3 restart 2>/dev/null || true
-          fi
-        fi
-      fi
-    done
-    sleep 30
-  done
-}
-EOF
-chmod +x "$FILES_DIR/etc/init.d/qmodem-mwan-watchdog"
-
-# ---- ensure files are executable where needed (udev etc) ----
-chmod +x "$FILES_DIR/etc/qmodem-hotplug.sh" || true
-chmod +x "$FILES_DIR/etc/init.d/qmodem-mwan-watchdog" || true
-
-# ---- final: apply .config or default ----
-if [ -f "$WORKDIR/xgp.config" ]; then
-  echo "[*] Using xgp.config from root dir"
-  cp -f "$WORKDIR/xgp.config" "$IW_DIR/.config"
-elif [ -f "$IW_DIR/.config" ]; then
-  echo "[*] Using existing .config in repo"
-else
-  echo "[*] No .config found, generating default defconfig"
-  make defconfig
-fi
-
-# ---- download + build with logging, capture first error ----
-BUILD_LOG="$WORKDIR/immortalwrt_build_output.log"
-set +e
-make download -j"$NPROC" V=s 2>&1 | tee -a "$BUILD_LOG"
-make -j"$NPROC" V=s 2>&1 | tee -a "$BUILD_LOG"
-RET=${PIPESTATUS[0]}
+#!/bin/bash
 set -e
 
-if [ "$RET" -ne 0 ]; then
-  echo "❌ BUILD FAILED"
-  FIRST_ERR_LINE=$(grep -n -m1 -E " error:|^make\\[.*\\]: \\*\\*\\*" "$BUILD_LOG" || true)
-  if [ -n "$FIRST_ERR_LINE" ]; then
-    echo "=== first error context ==="
-    LINE_NUM=$(echo "$FIRST_ERR_LINE" | cut -d: -f1)
-    sed -n "$((LINE_NUM-5)),$((LINE_NUM+5))p" "$BUILD_LOG" || true
-    echo "==========================="
+WORKDIR="$(pwd)"
+LOG="$WORKDIR/immortalwrt-build.log"
+
+echo "🚀 ImmortalWrt Auto Build" | tee "$LOG"
+echo "📂 Workdir: $WORKDIR" | tee -a "$LOG"
+
+##### 1. 获取 / 更新源码 #####
+if [ ! -d immortalwrt ]; then
+  git clone https://github.com/immortalwrt/immortalwrt.git
+fi
+
+cd immortalwrt
+
+git config pull.rebase false
+git stash >/dev/null 2>&1 || true
+git pull | tee -a "$LOG"
+
+##### 2. feeds 基础 #####
+./scripts/feeds update -a | tee -a "$LOG"
+./scripts/feeds install -a | tee -a "$LOG"
+
+##### 3. QModem feed #####
+grep -q qmodem feeds.conf.default || \
+  echo "src-git qmodem https://github.com/FUjr/QModem.git;main" >> feeds.conf.default
+
+./scripts/feeds update qmodem
+./scripts/feeds install -a -f -p qmodem
+
+##### 4. 第三方插件检测 #####
+clone_or_update() {
+  local url=$1
+  local dir=$2
+  if [ ! -d "$dir/.git" ]; then
+    git clone "$url" "$dir"
   else
-    echo "No explicit 'error:' line found; tail of log:"
-    tail -n 200 "$BUILD_LOG"
+    git -C "$dir" pull
   fi
+}
+
+clone_or_update https://github.com/asvow/luci-app-tailscale package/luci-app-tailscale
+clone_or_update https://github.com/EasyTier/luci-app-easytier package/luci-app-easytier
+clone_or_update https://github.com/sirpdboy/luci-app-lucky package/lucky
+clone_or_update https://github.com/zzzz0317/kmod-fb-tft-gc9307 package/zz/kmod-fb-tft-gc9307
+clone_or_update https://github.com/zzzz0317/xgp-v3-screen package/zz/xgp-v3-screen
+
+##### 5. 默认配置 #####
+[ -f .config ] || make defconfig
+
+##### 6. LAN / WiFi / 国家码 / WiFi密码 #####
+mkdir -p files/etc/uci-defaults
+
+cat > files/etc/uci-defaults/99-network << 'EOF'
+uci batch <<EOT
+set network.lan=interface
+set network.lan.device='br-lan'
+set network.lan.proto='static'
+set network.lan.ipaddr='192.168.1.1'
+set network.lan.netmask='255.255.255.0'
+commit network
+EOT
+EOF
+
+cat > files/etc/uci-defaults/99-wireless << 'EOF'
+uci batch <<EOT
+set wireless.radio0=wifi-device
+set wireless.radio0.type='mac80211'
+set wireless.radio0.disabled='0'
+set wireless.radio0.country='US'
+
+set wireless.default_radio0=wifi-iface
+set wireless.default_radio0.device='radio0'
+set wireless.default_radio0.network='lan'
+set wireless.default_radio0.mode='ap'
+set wireless.default_radio0.ssid='ImmortalWrt'
+set wireless.default_radio0.encryption='psk2'
+set wireless.default_radio0.key='88888888'
+commit wireless
+EOT
+EOF
+
+chmod +x files/etc/uci-defaults/*
+
+##### 7. QModem 多模块热插 #####
+mkdir -p files/etc/hotplug.d/{usb,pci}
+
+# USB 热插
+cat > files/etc/hotplug.d/usb/30-qmodem-autoslot <<'EOF'
+#!/bin/sh
+[ "$ACTION" != "add" ] && exit 0
+case "$DEVPATH" in
+  */usb*)
+    uci -q set qmodem.wwan=modem-slot
+    uci -q set qmodem.wwan.type='usb'
+    uci -q set qmodem.wwan.slot="${DEVPATH##*/}"
+    uci -q set qmodem.wwan.alias='wwan'
+    uci -q set qmodem.wwan.ipv6='1'
+    uci commit qmodem
+    /etc/init.d/qmodem restart
+    ;;
+esac
+EOF
+
+# PCIe 热插
+cat > files/etc/hotplug.d/pci/30-qmodem-autoslot <<'EOF'
+#!/bin/sh
+[ "$ACTION" != "add" ] && exit 0
+uci -q set qmodem.mpcie1=modem-slot
+uci -q set qmodem.mpcie1.type='pcie'
+uci -q set qmodem.mpcie1.slot="$PCI_SLOT_NAME"
+uci -q set qmodem.mpcie1.alias='mpcie1'
+uci -q set qmodem.mpcie1.ipv6='1'
+
+uci -q set qmodem.mpcie2=modem-slot
+uci -q set qmodem.mpcie2.type='pcie'
+uci -q set qmodem.mpcie2.slot="$PCI_SLOT_NAME"
+uci -q set qmodem.mpcie2.alias='mpcie2'
+uci -q set qmodem.mpcie2.ipv6='1'
+
+uci commit qmodem
+/etc/init.d/qmodem restart
+EOF
+
+chmod +x files/etc/hotplug.d/usb/* files/etc/hotplug.d/pci/*
+
+##### 8. mwan3 IPv4 + IPv6 策略 #####
+mkdir -p files/etc/uci-defaults
+
+# IPv4
+cat > files/etc/uci-defaults/91-mwan3-qmodem <<'EOF'
+uci batch <<EOF2
+set mwan3.modem=interface
+set mwan3.modem.enabled='1'
+set mwan3.modem.family='ipv4'
+set mwan3.modem.track_ip='1.1.1.1'
+set mwan3.modem.reliability='2'
+set mwan3.modem.interval='5'
+
+set mwan3.wan=interface
+set mwan3.wan.enabled='1'
+set mwan3.wan.track_ip='8.8.8.8'
+
+set mwan3.modem_m=member
+set mwan3.modem_m.interface='modem'
+set mwan3.modem_m.metric='1'
+set mwan3.modem_m.weight='3'
+
+set mwan3.wan_m=member
+set mwan3.wan_m.interface='wan'
+set mwan3.wan_m.metric='2'
+set mwan3.wan_m.weight='1'
+
+set mwan3.default=policy
+add_list mwan3.default.use_member='modem_m'
+add_list mwan3.default.use_member='wan_m'
+
+set mwan3.rule_all=rule
+set mwan3.rule_all.dest_ip='0.0.0.0/0'
+set mwan3.rule_all.use_policy='default'
+EOF2
+uci commit mwan3
+EOF
+
+# IPv6
+cat > files/etc/uci-defaults/92-mwan3-ipv6 <<'EOF'
+uci batch <<EOF2
+set mwan3.modem6=interface
+set mwan3.modem6.enabled='1'
+set mwan3.modem6.family='ipv6'
+set mwan3.modem6.track_ip='2001:4860:4860::8888'
+set mwan3.modem6.reliability='2'
+set mwan3.modem6.interval='5'
+
+set mwan3.wan6=interface
+set mwan3.wan6.enabled='1'
+set mwan3.wan6.family='ipv6'
+set mwan3.wan6.track_ip='2606:4700:4700::1111'
+
+set mwan3.modem6_m=member
+set mwan3.modem6_m.interface='modem6'
+set mwan3.modem6_m.metric='1'
+set mwan3.modem6_m.weight='3'
+
+set mwan3.wan6_m=member
+set mwan3.wan6_m.interface='wan6'
+set mwan3.wan6_m.metric='2'
+set mwan3.wan6_m.weight='1'
+
+set mwan3.default6=policy
+add_list mwan3.default6.use_member='modem6_m'
+add_list mwan3.default6.use_member='wan6_m'
+
+set mwan3.rule_all6=rule
+set mwan3.rule_all6.dest_ip='::/0'
+set mwan3.rule_all6.use_policy='default6'
+EOF2
+uci commit mwan3
+EOF
+
+chmod +x files/etc/uci-defaults/*
+
+##### 9. sysupgrade 保留 QModem / mwan3 / 网络配置 #####
+mkdir -p files/etc
+cat > files/etc/sysupgrade.conf <<'EOF'
+/etc/config/qmodem
+/etc/config/mwan3
+/etc/config/network
+/etc/config/wireless
+EOF
+
+##### 10. 下载 + 编译 #####
+make download -j$(nproc) || exit 1
+
+if ! make -j$(nproc); then
+  echo "❌ BUILD FAILED"
+  grep -R "error:" build_dir | head -n 20
   exit 1
 fi
 
-# ---- Build success: print artifact path and write summary file ----
 echo "✅ BUILD SUCCESS"
-ARTIFACT_DIR="$IW_DIR/bin/targets"
-echo "Artifacts under: $ARTIFACT_DIR"
-
-# write summary file for workflow
-cat > "$WORKDIR/build_summary.txt" <<EOF
-BUILD_UUID=${BUILD_UUID}
-BUILD_DATE=${BUILD_DATE}
-BUILD_REVISION=${BUILD_REVISION}
-IMMORTAL_HASH=${IMMORTAL_HASH}
-REPO_HASH=${REPO_HASH}
-ARTIFACT_DIR=${ARTIFACT_DIR}
-EOF
-
-echo "Done."
