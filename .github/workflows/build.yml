@@ -5,10 +5,6 @@ on:
     branches: [main]
   workflow_dispatch:
 
-permissions:
-  contents: write
-  packages: read
-
 jobs:
   build:
     runs-on: ubuntu-22.04
@@ -20,98 +16,32 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v3
 
-      - name: Cache OpenWrt dl and staging_dir
+      - name: Cache dl and staging_dir
         uses: actions/cache@v3
-        if: always()
         with:
           path: |
             immortalwrt/dl
             immortalwrt/staging_dir
           key: ${{ runner.os }}-immortalwrt-${{ hashFiles('immortalwrt/feeds.conf.default', '.config') }}
 
-      - name: Install build dependencies
+      - name: Install dependencies
         run: |
           chmod +x ./install-env.sh
           sudo ./install-env.sh
-
-      - name: Setup Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: 3.11
-
-      - name: Clone or update ImmortalWrt
-        run: |
-          if [ -d "$IMMORTAL_DIR/.git" ]; then
-            echo "[+] ImmortalWrt 已存在，执行 git pull 更新源码"
-            cd "$IMMORTAL_DIR"
-            git reset --hard HEAD
-            git clean -fd
-            git pull
-          else
-            echo "[+] 克隆 ImmortalWrt"
-            git clone https://github.com/immortalwrt/immortalwrt.git "$IMMORTAL_DIR"
-          fi
 
       - name: Build ImmortalWrt
         run: |
           chmod +x ./build-immortalwrt.sh
           bash ./build-immortalwrt.sh
 
-      - name: Generate snapshot tag
-        id: snapshot
-        run: |
-          SNAPSHOT_DATE=$(date "+%Y%m%d%H%M")
-          SNAPSHOT_TAG="R${SNAPSHOT_DATE}"
-          echo "snapshot_tag=${SNAPSHOT_TAG}" >> $GITHUB_OUTPUT
-          echo "Snapshot tag: ${SNAPSHOT_TAG}"
-
-      - name: Generate release log
-        run: |
-          mkdir -p logs
-          echo "ImmortalWrt Build ${{ steps.snapshot.outputs.snapshot_tag }}" > logs/release_notes.txt
-          echo "Build date: $(date)" >> logs/release_notes.txt
-          echo "" >> logs/release_notes.txt
-          echo "Generated files:" >> logs/release_notes.txt
-          ls -lh immortalwrt-* >> logs/release_notes.txt
-          echo "" >> logs/release_notes.txt
-          echo "SHA256 sums:" >> logs/release_notes.txt
-          cat sha256sums >> logs/release_notes.txt
-
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: immortalwrt-artifacts
           path: |
-            immortalwrt-*
-            profiles.json
-            sha256sums
-            logs/release_notes.txt
+            immortalwrt-rockchip-armv8-nlnet_xiguapi-v3.manifest
+            immortalwrt-rockchip-armv8-nlnet_xiguapi-v3-squashfs-sysupgrade.img.gz
             config.buildinfo
             feeds.buildinfo
-            *.manifest
-            *-squashfs-sysupgrade.img.gz
-
-      - name: Create GitHub Release
-        id: create_release
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: ${{ steps.snapshot.outputs.snapshot_tag }}
-          name: ImmortalWrt Build ${{ steps.snapshot.outputs.snapshot_tag }}
-          body_path: logs/release_notes.txt
-          draft: false
-          prerelease: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload Release Assets
-        uses: softprops/action-gh-release@v1
-        with:
-          files: |
-            immortalwrt-*
             profiles.json
             sha256sums
-            logs/release_notes.txt
-            config.buildinfo
-            feeds.buildinfo
-            *.manifest
-            *-squashfs-sysupgrade.img.gz
