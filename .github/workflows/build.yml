@@ -1,105 +1,42 @@
-name: Build ImmortalWrt Snapshot
+name: ImmortalWrt Build
 
 on:
+  workflow_dispatch:
   push:
     branches: [ main ]
-  workflow_dispatch:
 
 permissions:
   contents: write
-  packages: read
 
 jobs:
   build:
     runs-on: ubuntu-22.04
-    env:
-      DEBIAN_FRONTEND: noninteractive
 
     steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Debug workspace (important)
-        run: |
-          echo "=== PWD ==="
-          pwd
-          echo "=== ROOT FILES ==="
-          ls -lah
-          echo "=== scripts ==="
-          ls -lah scripts || true
+      - uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
 
-      - name: Install build environment
+      - name: Install dependencies
         run: |
           chmod +x ./install-env.sh
           sudo ./install-env.sh
 
-      - name: Setup Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: 3.11
-
       - name: Build ImmortalWrt
         run: |
-          chmod +x ./scripts/build-immortalwrt.sh
-          ./scripts/build-immortalwrt.sh
+          chmod +x ./build-immortalwrt.sh
+          ./build-immortalwrt.sh
 
-      - name: Generate snapshot tag
-        id: snapshot
-        run: |
-          SNAPSHOT_DATE=$(date "+%Y%m%d%H%M")
-          SNAPSHOT_TAG="R${SNAPSHOT_DATE}"
-          echo "snapshot_tag=${SNAPSHOT_TAG}" >> "$GITHUB_OUTPUT"
-          echo "Snapshot tag: ${SNAPSHOT_TAG}"
-
-      - name: Generate release notes
-        run: |
-          mkdir -p logs
-          {
-            echo "ImmortalWrt Snapshot Build"
-            echo "Tag: ${{ steps.snapshot.outputs.snapshot_tag }}"
-            echo "Build date: $(date)"
-            echo
-            echo "Generated firmware files:"
-            ls -lh immortalwrt-* || true
-            echo
-            echo "SHA256:"
-            cat sha256sums || true
-          } > logs/release_notes.txt
-
-      - name: Upload workflow artifacts
+      - name: Upload firmware
         uses: actions/upload-artifact@v4
         with:
-          name: immortalwrt-build
+          name: immortalwrt-firmware
           path: |
-            immortalwrt-*
-            profiles.json
-            sha256sums
-            *.manifest
-            *.img.gz
-            config.buildinfo
-            feeds.buildinfo
-            logs/release_notes.txt
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: ${{ steps.snapshot.outputs.snapshot_tag }}
-          name: ImmortalWrt Snapshot ${{ steps.snapshot.outputs.snapshot_tag }}
-          body_path: logs/release_notes.txt
-          prerelease: true
-          draft: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload release assets
-        uses: softprops/action-gh-release@v1
-        with:
-          files: |
-            immortalwrt-*
-            profiles.json
-            sha256sums
-            *.manifest
-            *.img.gz
-            config.buildinfo
-            feeds.buildinfo
-            logs/release_notes.txt
+            immortalwrt/bin/targets/**/config.buildinfo
+            immortalwrt/bin/targets/**/feeds.buildinfo
+            immortalwrt/bin/targets/**/*.manifest
+            immortalwrt/bin/targets/**/*.img.gz
+            immortalwrt/bin/targets/**/profiles.json
+            immortalwrt/bin/targets/**/sha256sums
