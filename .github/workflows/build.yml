@@ -1,51 +1,23 @@
-name: ImmortalWrt XGP Build & Release
+name: ImmortalWrt Full Build & Release
 
 on:
-  workflow_dispatch:
-  schedule:
-    - cron: '0 18 * * 4'   # weekly nightly
   push:
-    tags:
-      - 'v*'              # stable release by tag
-
-permissions:
-  contents: write
-
-env:
-  TZ: Asia/Shanghai
+    branches:
+      - main
+  workflow_dispatch:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
+    env:
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
 
     steps:
-      # -------- 基础信息 --------
-      - name: Show system info
-        run: |
-          df -h
-          free -h
-          nproc
-
-      # -------- 扩容（必须在 checkout 前） --------
-      - name: Maximize build space
-        uses: easimon/maximize-build-space@master
-        with:
-          root-reserve-mb: 10240
-          swap-size-mb: 1024
-          remove-dotnet: 'false'
-
-      # -------- 拉代码（只一次，避免 workspace 被清空） --------
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: Debug workspace
-        run: |
-          echo "PWD=$(pwd)"
-          echo "GITHUB_WORKSPACE=$GITHUB_WORKSPACE"
-          ls -lah
-          find . -maxdepth 2 -type f || true
 
       # -------- 构建依赖（你确认过的版本） --------
       - name: Install build dependencies
@@ -71,88 +43,78 @@ jobs:
             swig texinfo uglifyjs upx-ucl unzip \
             vim wget xmlto xxd zlib1g-dev zstd
 
-      # -------- cache --------
-      - name: Cache dl & staging_dir
-        uses: actions/cache@v4
+      - name: Ensure build script is executable
+        run: |
+          chmod +x build-immortalwrt.sh
+
+      - name: Run build script
+        id: build
+        run: |
+          ./build-immortalwrt.sh
+
+      - name: Show summary
+        run: |
+          echo "----- Build summary -----"
+          cat build_summary.txt || true
+          echo "-------------------------"
+
+      - name: Upload artifacts (firmware)
+        if: success()
+        uses: actions/upload-artifact@v4
         with:
+          name: immortalwrt-artifacts
           path: |
-            immortalwrt/dl
-            immortalwrt/staging_dir
-          key: ${{ runner.os }}-immortalwrt-${{ hashFiles('xgp.config') }}
+            immortalwrt/bin/targets/**
+            build_summary.txt
 
-      # -------- 检查并执行构建脚本 --------
-      - name: Run build script (capture log)
-        shell: bash
-        run: |
-          set -o pipefail
-          test -f build-immortalwrt-gha.sh || {
-            echo "❌ build-immortalwrt-gha.sh not found"; exit 1; }
-          chmod +x build-immortalwrt-gha.sh
-
-          ./build-immortalwrt-gha.sh 2>&1 | tee build.log || true
-
-          if grep -n -E " error:|^make\\[|^ERROR:" build.log; then
-            echo "❌ Build failed, first error:"
-            grep -n -E " error:|^make\\[|^ERROR:" build.log | head -n 1
-            exit 1
-          fi
-
-      # -------- 处理固件 / 重命名 / sha256 --------
-      - name: Prepare firmware
+      - name: Prepare release metadata
         if: success()
+        id: meta
         run: |
-          set -e
-          OUTDIR="immortalwrt/bin/targets/rockchip/armv8"
-          cd immortalwrt
+          . ./build_summary.txt
+          DATE_TAG=$(date -u +"%Y%m%d%H%M")
+          SHORT_SHA=$(git rev-parse --short HEAD || echo "nogit")
+          TAG="build-${DATE_TAG}-${SHORT_SHA}-${BUILD_UUID}"
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "name=ImmortalWrt build ${BUILD_REVISION} ${DATE_TAG}" >> $GITHUB_OUTPUT
+          # compute artifact path (pick first bin/targets subdir)
+          ART_DIR=$(ls -d immortalwrt/bin/targets/* 2>/dev/null | head -n1 || true)
+          echo "artifact_dir=${ART_DIR}" >> $GITHUB_OUTPUT
 
-          KERNEL=$(grep -m1 '^LINUX_VERSION=' include/version.mk | cut -d= -f2 || echo unknown)
-          GIT=$(git rev-parse --short HEAD)
-          DATE=$(date +%Y%m%d)
-
-          PREFIX="ImmortalWrt-XGP-v3-${KERNEL}-g${GIT}-${DATE}"
-
-          cd "$OUTDIR"
-          for f in *sysupgrade*.img.gz; do
-            [ -f "$f" ] && mv "$f" "${PREFIX}-sysupgrade.img.gz"
-          done
-
-          sha256sum *.img.gz > sha256sums || true
-          ls -lah
-
-          echo "PREFIX=$PREFIX" > $GITHUB_WORKSPACE/release_meta.env
-          echo "KERNEL=$KERNEL" >> $GITHUB_WORKSPACE/release_meta.env
-          echo "GIT=$GIT" >> $GITHUB_WORKSPACE/release_meta.env
-
-      # -------- 驱动 / QModem 变更日志 --------
-      - name: Generate driver changelog
-        if: success()
-        run: |
-          cd immortalwrt
-          echo "### 驱动 / QModem 变更" > $GITHUB_WORKSPACE/driver_change.log
-          git log -n 30 --oneline \
-            package/qmodem package/zz package/luci-app-qmodem \
-            >> $GITHUB_WORKSPACE/driver_change.log || true
-
-      # -------- 收集产物 --------
-      - name: Collect artifacts
-        if: success()
-        run: |
-          mkdir -p release
-          cp immortalwrt/bin/targets/rockchip/armv8/*.{img.gz,manifest,buildinfo} release/ 2>/dev/null || true
-          cp immortalwrt/bin/targets/rockchip/armv8/sha256sums release/ 2>/dev/null || true
-          ls -lah release
-
-      # -------- 发布 Release --------
       - name: Create GitHub Release
         if: success()
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v1
         with:
-          tag_name: build-${{ github.run_number }}
-          name: ImmortalWrt XGP Build #${{ github.run_number }}
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.name }}
           body: |
-            ✅ Kernel: $(grep KERNEL release_meta.env | cut -d= -f2)
-            ✅ Git: $(grep GIT release_meta.env | cut -d= -f2)
+            Auto build from ${{ github.repository }}@${{ github.sha }}
+            Build UUID: ${{ steps.meta.outputs.tag }}
+            Build info:
+            $(cat build_summary.txt || true)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-            $(sed -n '1,200p' driver_change.log)
-          files: |
-            release/*
+      - name: Upload release assets
+        if: success()
+        run: |
+          ART_DIR="${{ steps.meta.outputs.artifact_dir }}"
+          if [ -d "$ART_DIR" ]; then
+            echo "Uploading assets from $ART_DIR"
+            for f in $(find "$ART_DIR" -type f -name "*.bin" -o -name "*.img" -o -name "*.tar" -o -name "*.gz" -o -name "*.ipk" -o -name "*.zip" 2>/dev/null); do
+              echo "Uploading $f"
+              gh release upload "${{ steps.meta.outputs.tag }}" "$f" --clobber || true
+            done
+          else
+            echo "No artifact dir: $ART_DIR"
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # gh cli is required; install if not present:
+      - name: Ensure GitHub CLI installed
+        if: success()
+        run: |
+          if ! command -v gh >/dev/null 2>&1; then
+            sudo apt update
+            sudo apt install -y gh
+          fi
