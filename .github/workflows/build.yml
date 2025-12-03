@@ -1,8 +1,8 @@
-name: Build ImmortalWrt
+name: Build ImmortalWrt Snapshot
 
 on:
   push:
-    branches: [main]
+    branches: [ main ]
   workflow_dispatch:
 
 permissions:
@@ -16,10 +16,19 @@ jobs:
       DEBIAN_FRONTEND: noninteractive
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v3
+      - name: Checkout source
+        uses: actions/checkout@v4
 
-      - name: Install build dependencies
+      - name: Debug workspace (important)
+        run: |
+          echo "=== PWD ==="
+          pwd
+          echo "=== ROOT FILES ==="
+          ls -lah
+          echo "=== scripts ==="
+          ls -lah scripts || true
+
+      - name: Install build environment
         run: |
           chmod +x ./install-env.sh
           sudo ./install-env.sh
@@ -31,66 +40,66 @@ jobs:
 
       - name: Build ImmortalWrt
         run: |
-          chmod +x ./build-immortalwrt.sh
-          ./build-immortalwrt.sh
+          chmod +x ./scripts/build-immortalwrt.sh
+          ./scripts/build-immortalwrt.sh
 
-      - name: Generate snapshot version with config state
+      - name: Generate snapshot tag
         id: snapshot
         run: |
           SNAPSHOT_DATE=$(date "+%Y%m%d%H%M")
           SNAPSHOT_TAG="R${SNAPSHOT_DATE}"
-          echo "snapshot_tag=${SNAPSHOT_TAG}" >> $GITHUB_OUTPUT
+          echo "snapshot_tag=${SNAPSHOT_TAG}" >> "$GITHUB_OUTPUT"
           echo "Snapshot tag: ${SNAPSHOT_TAG}"
 
-      - name: Generate changelog
-        id: changelog
+      - name: Generate release notes
         run: |
           mkdir -p logs
-          RELEASE_LOG="logs/release_notes.txt"
-          echo "ImmortalWrt Build ${{ steps.snapshot.outputs.snapshot_tag }}" > $RELEASE_LOG
-          echo "Build date: $(date)" >> $RELEASE_LOG
-          echo "" >> $RELEASE_LOG
-          echo "Generated files:" >> $RELEASE_LOG
-          ls -lh immortalwrt-* >> $RELEASE_LOG
-          echo "" >> $RELEASE_LOG
-          echo "SHA256 sums:" >> $RELEASE_LOG
-          cat sha256sums >> $RELEASE_LOG
+          {
+            echo "ImmortalWrt Snapshot Build"
+            echo "Tag: ${{ steps.snapshot.outputs.snapshot_tag }}"
+            echo "Build date: $(date)"
+            echo
+            echo "Generated firmware files:"
+            ls -lh immortalwrt-* || true
+            echo
+            echo "SHA256:"
+            cat sha256sums || true
+          } > logs/release_notes.txt
 
-      - name: Upload artifacts
+      - name: Upload workflow artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: immortalwrt-artifacts
+          name: immortalwrt-build
           path: |
             immortalwrt-*
             profiles.json
             sha256sums
-            logs/release_notes.txt
+            *.manifest
+            *.img.gz
             config.buildinfo
             feeds.buildinfo
-            *.manifest
-            *-squashfs-sysupgrade.img.gz
+            logs/release_notes.txt
 
       - name: Create GitHub Release
-        id: create_release
         uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ steps.snapshot.outputs.snapshot_tag }}
-          name: ImmortalWrt Build ${{ steps.snapshot.outputs.snapshot_tag }}
+          name: ImmortalWrt Snapshot ${{ steps.snapshot.outputs.snapshot_tag }}
           body_path: logs/release_notes.txt
-          draft: false
           prerelease: true
+          draft: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Upload Release Assets
+      - name: Upload release assets
         uses: softprops/action-gh-release@v1
         with:
           files: |
             immortalwrt-*
             profiles.json
             sha256sums
-            logs/release_notes.txt
+            *.manifest
+            *.img.gz
             config.buildinfo
             feeds.buildinfo
-            *.manifest
-            *-squashfs-sysupgrade.img.gz
+            logs/release_notes.txt
