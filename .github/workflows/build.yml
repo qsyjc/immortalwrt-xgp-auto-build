@@ -14,6 +14,7 @@ jobs:
     runs-on: ubuntu-22.04
     env:
       DEBIAN_FRONTEND: noninteractive
+      IMMORTAL_DIR: ${{ github.workspace }}/immortalwrt
 
     steps:
       - name: Checkout repository
@@ -37,6 +38,19 @@ jobs:
         uses: actions/setup-python@v4
         with:
           python-version: 3.11
+
+      - name: Clone or update ImmortalWrt
+        run: |
+          if [ -d "$IMMORTAL_DIR/.git" ]; then
+            echo "[+] ImmortalWrt 已存在，执行 git pull 更新源码"
+            cd "$IMMORTAL_DIR"
+            git reset --hard HEAD
+            git clean -fd
+            git pull
+          else
+            echo "[+] 克隆 ImmortalWrt"
+            git clone https://github.com/immortalwrt/immortalwrt.git "$IMMORTAL_DIR"
+          fi
 
       - name: Build ImmortalWrt
         run: |
