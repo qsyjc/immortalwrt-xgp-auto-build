@@ -5,6 +5,9 @@ on:
   schedule:
     - cron: '0 18 * * 4'
 
+permissions:
+  contents: write   # 👈 创建 Release 必须
+
 jobs:
   build:
     runs-on: ubuntu-24.04
@@ -80,18 +83,35 @@ jobs:
             exit 1
           fi
 
-      - name: Collect artifacts
+      - name: Rename firmware
         if: success()
         run: |
-          mkdir -p release
-          cp immortalwrt/bin/targets/rockchip/armv8/*.img.gz release/ 2>/dev/null || true
-          cp immortalwrt/bin/targets/rockchip/armv8/*.manifest release/ 2>/dev/null || true
-          cp immortalwrt/bin/targets/rockchip/armv8/*buildinfo release/ 2>/dev/null || true
-          cp immortalwrt/bin/targets/rockchip/armv8/sha256sums release/ 2>/dev/null || true
-          ls -lah release
+          set -e
+          cd immortalwrt/bin/targets/rockchip/armv8
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+          DATE=$(date +%Y%m%d)
+          TIME=$(date +%H%M)
+          PREFIX="ImmortalWrt-XGP-v3-${DATE}-${TIME}"
+
+          for f in *sysupgrade*.img.gz; do
+            mv "$f" "${PREFIX}-sysupgrade.img.gz"
+          done
+
+          ls -lah
+
+      - name: Create GitHub Release
+        if: success()
+        uses: softprops/action-gh-release@v2
         with:
-          name: immortalwrt-xgp-firmware
-          path: release/
+          tag_name: build-${{ github.run_number }}
+          name: ImmortalWrt XGP 自动构建 #${{ github.run_number }}
+          body: |
+            ✅ ImmortalWrt XGP 自动编译完成
+
+            - 构建时间：${{ github.run_started_at }}
+            - 分支：${{ github.ref_name }}
+            - Commit：${{ github.sha }}
+
+            固件已通过 GitHub Actions 自动编译并上传。
+          files: |
+            immortalwrt/bin/targets/rockchip/armv8/*.img.gz
