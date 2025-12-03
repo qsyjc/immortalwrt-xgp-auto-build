@@ -5,6 +5,10 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: write
+  packages: read
+
 jobs:
   build:
     runs-on: ubuntu-22.04
@@ -34,36 +38,11 @@ jobs:
         id: snapshot
         run: |
           SNAPSHOT_DATE=$(date "+%Y%m%d%H%M")
-
-          # 获取关键模块 Git Hash
-          QMODEM_HASH=$(git -C feeds/qmodem rev-parse --short HEAD || echo "none")
-          WIFI_HASH=$(git -C package/network/config/wireless rev-parse --short HEAD || echo "none")
-          LAN_HASH=$(git -C package/network/config/network rev-parse --short HEAD || echo "none")
-
-          # 获取配置文件内容哈希
-          QMODEM_FILE_HASH=$(sha256sum feeds/qmodem/application/qmodem/files/etc/config/qmodem | awk '{print $1}' || echo "none")
-          WIFI_FILE_HASH=$(sha256sum package/network/config/wireless/files/etc/config/wireless | awk '{print $1}' || echo "none")
-          LAN_FILE_HASH=$(sha256sum package/network/config/network/files/etc/config/network | awk '{print $1}' || echo "none")
-
-          # 检测配置文件是否有变动
-          QMODEM_STATE=$(git -C feeds/qmodem diff --quiet --exit-code -- application/qmodem/files/etc/config/qmodem && echo "未变动" || echo "已变动")
-          WIFI_STATE=$(git -C package/network/config/wireless diff --quiet --exit-code -- files/etc/config/wireless && echo "未变动" || echo "已变动")
-          LAN_STATE=$(git -C package/network/config/network diff --quiet --exit-code -- files/etc/config/network && echo "未变动" || echo "已变动")
-
-          # 构建 Snapshot Tag
-          SNAPSHOT_TAG="R${SNAPSHOT_DATE}-Q${QMODEM_HASH}-${QMODEM_FILE_HASH}-W${WIFI_HASH}-${WIFI_FILE_HASH}-L${LAN_HASH}-${LAN_FILE_HASH}"
+          SNAPSHOT_TAG="R${SNAPSHOT_DATE}"
           echo "snapshot_tag=${SNAPSHOT_TAG}" >> $GITHUB_OUTPUT
           echo "Snapshot tag: ${SNAPSHOT_TAG}"
 
-      - name: Generate checksum files
-        run: |
-          mkdir -p checksums
-          find immortalwrt/bin/targets -type f \( -name "*.img" -o -name "*.bin" -o -name "*.ipk" \) | while read f; do
-            sha256sum "$f" >> checksums/sha256sum.txt
-            md5sum "$f" >> checksums/md5sum.txt
-          done
-
-      - name: Generate changelog and package size
+      - name: Generate changelog
         id: changelog
         run: |
           mkdir -p logs
@@ -71,30 +50,25 @@ jobs:
           echo "ImmortalWrt Build ${{ steps.snapshot.outputs.snapshot_tag }}" > $RELEASE_LOG
           echo "Build date: $(date)" >> $RELEASE_LOG
           echo "" >> $RELEASE_LOG
-          echo "Generated firmware and packages:" >> $RELEASE_LOG
-          find immortalwrt/bin/targets -type f \( -name "*.img" -o -name "*.bin" -o -name "*.ipk" \) -exec ls -lh {} \; >> $RELEASE_LOG
+          echo "Generated files:" >> $RELEASE_LOG
+          ls -lh immortalwrt-* >> $RELEASE_LOG
           echo "" >> $RELEASE_LOG
-          echo "SHA256 checksums:" >> $RELEASE_LOG
-          cat checksums/sha256sum.txt >> $RELEASE_LOG
-          echo "" >> $RELEASE_LOG
-          echo "MD5 checksums:" >> $RELEASE_LOG
-          cat checksums/md5sum.txt >> $RELEASE_LOG
-          echo "" >> $RELEASE_LOG
-          echo "Configuration file hashes and state:" >> $RELEASE_LOG
-          echo "QModem: $QMODEM_FILE_HASH ($QMODEM_STATE)" >> $RELEASE_LOG
-          echo "WiFi: $WIFI_FILE_HASH ($WIFI_STATE)" >> $RELEASE_LOG
-          echo "LAN: $LAN_FILE_HASH ($LAN_STATE)" >> $RELEASE_LOG
+          echo "SHA256 sums:" >> $RELEASE_LOG
+          cat sha256sums >> $RELEASE_LOG
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
-          name: immortalwrt-firmware
+          name: immortalwrt-artifacts
           path: |
-            immortalwrt/bin/targets/**/*
-            immortalwrt/build_dir/target-*/packages/*.ipk
-            checksums/sha256sum.txt
-            checksums/md5sum.txt
+            immortalwrt-*
+            profiles.json
+            sha256sums
             logs/release_notes.txt
+            config.buildinfo
+            feeds.buildinfo
+            *.manifest
+            *-squashfs-sysupgrade.img.gz
 
       - name: Create GitHub Release
         id: create_release
@@ -112,8 +86,11 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            immortalwrt/bin/targets/**/*.img
-            immortalwrt/bin/targets/**/*.bin
-            immortalwrt/bin/targets/**/*.ipk
-            checksums/sha256sum.txt
-            checksums/md5sum.txt
+            immortalwrt-*
+            profiles.json
+            sha256sums
+            logs/release_notes.txt
+            config.buildinfo
+            feeds.buildinfo
+            *.manifest
+            *-squashfs-sysupgrade.img.gz
