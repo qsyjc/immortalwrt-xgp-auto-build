@@ -3,91 +3,156 @@ name: ImmortalWrt XGP Build & Release
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 18 * * *'
+    - cron: '0 18 * * 4'   # weekly nightly
   push:
     tags:
-      - 'v*'
+      - 'v*'              # stable release by tag
 
 permissions:
   contents: write
 
+env:
+  TZ: Asia/Shanghai
+
 jobs:
   build:
     runs-on: ubuntu-24.04
-    env:
-      TZ: Asia/Shanghai
 
     steps:
-      - name: Checkout
+      # -------- 基础信息 --------
+      - name: Show system info
+        run: |
+          df -h
+          free -h
+          nproc
+
+      # -------- 扩容（必须在 checkout 前） --------
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 10240
+          swap-size-mb: 1024
+          remove-dotnet: 'false'
+
+      # -------- 拉代码（只一次，避免 workspace 被清空） --------
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # 👈 必须，为了 git log
+          fetch-depth: 0
 
-      - name: Determine channel
+      - name: Debug workspace
         run: |
-          if [[ "${{ github.event_name }}" == "schedule" ]]; then
-            echo "CHANNEL=nightly" >> $GITHUB_ENV
-          else
-            echo "CHANNEL=stable" >> $GITHUB_ENV
+          echo "PWD=$(pwd)"
+          echo "GITHUB_WORKSPACE=$GITHUB_WORKSPACE"
+          ls -lah
+          find . -maxdepth 2 -type f || true
+
+      # -------- 构建依赖（你确认过的版本） --------
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            ack antlr3 asciidoc autoconf automake autopoint \
+            binutils bison build-essential bzip2 ccache \
+            clang cmake cpio curl device-tree-compiler \
+            ecj fastjar flex gawk gettext gcc-multilib \
+            g++-multilib git gnutls-dev gperf haveged \
+            help2man intltool lib32gcc-s1 libc6-dev-i386 \
+            libelf-dev libglib2.0-dev libgmp3-dev \
+            libltdl-dev libmpc-dev libmpfr-dev \
+            libncurses-dev libpython3-dev \
+            libreadline-dev libssl-dev libtool \
+            libyaml-dev libz-dev lld llvm lrzsz \
+            mkisofs msmtp nano ninja-build \
+            p7zip p7zip-full patch pkgconf \
+            python3 python3-pip python3-ply \
+            python3-pyelftools qemu-utils re2c \
+            rsync scons squashfs-tools subversion \
+            swig texinfo uglifyjs upx-ucl unzip \
+            vim wget xmlto xxd zlib1g-dev zstd
+
+      # -------- cache --------
+      - name: Cache dl & staging_dir
+        uses: actions/cache@v4
+        with:
+          path: |
+            immortalwrt/dl
+            immortalwrt/staging_dir
+          key: ${{ runner.os }}-immortalwrt-${{ hashFiles('xgp.config') }}
+
+      # -------- 检查并执行构建脚本 --------
+      - name: Run build script (capture log)
+        shell: bash
+        run: |
+          set -o pipefail
+          test -f build-immortalwrt-gha.sh || {
+            echo "❌ build-immortalwrt-gha.sh not found"; exit 1; }
+          chmod +x build-immortalwrt-gha.sh
+
+          ./build-immortalwrt-gha.sh 2>&1 | tee build.log || true
+
+          if grep -n -E " error:|^make\\[|^ERROR:" build.log; then
+            echo "❌ Build failed, first error:"
+            grep -n -E " error:|^make\\[|^ERROR:" build.log | head -n 1
+            exit 1
           fi
 
-      - name: Build
-        run: |
-          chmod +x build-immortalwrt-gha.sh
-          ./build-immortalwrt-gha.sh
-
-      - name: Prepare firmware & metadata
+      # -------- 处理固件 / 重命名 / sha256 --------
+      - name: Prepare firmware
+        if: success()
         run: |
           set -e
+          OUTDIR="immortalwrt/bin/targets/rockchip/armv8"
           cd immortalwrt
 
-          KERNEL=$(grep -R "LINUX_VERSION-" include | head -n1 | sed 's/.*=//')
-          GITHASH=$(git rev-parse --short HEAD)
+          KERNEL=$(grep -m1 '^LINUX_VERSION=' include/version.mk | cut -d= -f2 || echo unknown)
+          GIT=$(git rev-parse --short HEAD)
           DATE=$(date +%Y%m%d)
 
-          OUT=bin/targets/rockchip/armv8
-          PREFIX="ImmortalWrt-XGP-v3-${KERNEL}-g${GITHASH}-${DATE}"
+          PREFIX="ImmortalWrt-XGP-v3-${KERNEL}-g${GIT}-${DATE}"
 
-          cd $OUT
-
+          cd "$OUTDIR"
           for f in *sysupgrade*.img.gz; do
-            mv "$f" "${PREFIX}-sysupgrade.img.gz"
+            [ -f "$f" ] && mv "$f" "${PREFIX}-sysupgrade.img.gz"
           done
 
-          sha256sum *.img.gz > sha256sums
-
+          sha256sum *.img.gz > sha256sums || true
           ls -lah
 
+          echo "PREFIX=$PREFIX" > $GITHUB_WORKSPACE/release_meta.env
+          echo "KERNEL=$KERNEL" >> $GITHUB_WORKSPACE/release_meta.env
+          echo "GIT=$GIT" >> $GITHUB_WORKSPACE/release_meta.env
+
+      # -------- 驱动 / QModem 变更日志 --------
       - name: Generate driver changelog
+        if: success()
         run: |
-          set -e
-          LAST_TAG=$(git tag --sort=-creatordate | head -n1)
+          cd immortalwrt
+          echo "### 驱动 / QModem 变更" > $GITHUB_WORKSPACE/driver_change.log
+          git log -n 30 --oneline \
+            package/qmodem package/zz package/luci-app-qmodem \
+            >> $GITHUB_WORKSPACE/driver_change.log || true
 
-          if [ -z "$LAST_TAG" ]; then
-            echo "### 驱动 / QModem 变更" > driver.log
-            echo "首次构建，无历史记录。" >> driver.log
-          else
-            echo "### 驱动 / QModem 变更" > driver.log
-            git log ${LAST_TAG}..HEAD \
-              -- package/qmodem package/network target/linux/rockchip \
-              --oneline >> driver.log || echo "无变更记录" >> driver.log
-          fi
+      # -------- 收集产物 --------
+      - name: Collect artifacts
+        if: success()
+        run: |
+          mkdir -p release
+          cp immortalwrt/bin/targets/rockchip/armv8/*.{img.gz,manifest,buildinfo} release/ 2>/dev/null || true
+          cp immortalwrt/bin/targets/rockchip/armv8/sha256sums release/ 2>/dev/null || true
+          ls -lah release
 
-          cat driver.log
-
-      - name: Create Release
+      # -------- 发布 Release --------
+      - name: Create GitHub Release
+        if: success()
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ env.CHANNEL }}-${{ github.run_number }}
-          name: ImmortalWrt XGP ${{ env.CHANNEL }} 构建
+          tag_name: build-${{ github.run_number }}
+          name: ImmortalWrt XGP Build #${{ github.run_number }}
           body: |
-            ✅ 编译通道：${{ env.CHANNEL }}
-            ✅ Kernel：已集成
-            ✅ Git：${{ github.sha }}
+            ✅ Kernel: $(grep KERNEL release_meta.env | cut -d= -f2)
+            ✅ Git: $(grep GIT release_meta.env | cut -d= -f2)
 
-            $(cat driver.log)
+            $(sed -n '1,200p' driver_change.log)
           files: |
-            immortalwrt/bin/targets/rockchip/armv8/*.img.gz
-            immortalwrt/bin/targets/rockchip/armv8/sha256sums
-            immortalwrt/bin/targets/rockchip/armv8/manifest
-            immortalwrt/bin/targets/rockchip/armv8/config.buildinfo
+            release/*
