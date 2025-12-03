@@ -1,39 +1,140 @@
-name: Build ImmortalWrt
+name: Build ImmortalWrt CI
 
 on:
-  workflow_dispatch:
   push:
     branches: [ main ]
+  workflow_dispatch:
 
 permissions:
   contents: write
+  packages: read
 
 jobs:
   build:
     runs-on: ubuntu-22.04
+    timeout-minutes: 720
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Install dependencies
+      - name: Debug workspace
         run: |
-          chmod +x install-env.sh
-          ./install-env.sh
+          echo "PWD: $(pwd)"
+          ls -lah
+
+      - name: Install environment packages
+        run: |
+          chmod +x ./install-env.sh
+          sudo ./install-env.sh
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
 
       - name: Build ImmortalWrt
+        id: build_step
         run: |
-          chmod +x build-immortalwrt.sh
-          ./build-immortalwrt.sh
+          chmod +x ./build-immortalwrt.sh
+          bash ./build-immortalwrt.sh
 
-      - name: Upload firmware
+      - name: Generate Snapshot tag & config hashes
+        id: snapshot
+        run: |
+          SNAPSHOT_DATE=$(date "+%Y%m%d%H%M")
+          # attempt to compute key hashes (fall back to none)
+          QHASH=$(git -C feeds/qmodem rev-parse --short HEAD 2>/dev/null || echo "none")
+          WHASH=$(git -C package/network/config/wireless rev-parse --short HEAD 2>/dev/null || echo "none")
+          NHASH=$(git -C package/network/config/network rev-parse --short HEAD 2>/dev/null || echo "none")
+
+          QF=$(sha256sum feeds/qmodem/application/qmodem/files/etc/config/qmodem 2>/dev/null | awk '{print $1}' || echo "none")
+          WF=$(sha256sum package/network/config/wireless/files/etc/config/wireless 2>/dev/null | awk '{print $1}' || echo "none")
+          NF=$(sha256sum package/network/config/network/files/etc/config/network 2>/dev/null | awk '{print $1}' || echo "none")
+
+          # determine if config files changed relative to feed head
+          QSTATE=$(git -C feeds/qmodem diff --quiet -- application/qmodem/files/etc/config/qmodem && echo "clean" || echo "modified")
+          WSTATE=$(git -C package/network/config/wireless diff --quiet -- files/etc/config/wireless && echo "clean" || echo "modified")
+          NSTATE=$(git -C package/network/config/network diff --quiet -- files/etc/config/network && echo "clean" || echo "modified")
+
+          SNAP="R${SNAPSHOT_DATE}-Q${QHASH}-${QF}-W${WHASH}-${WF}-N${NHASH}-${NF}"
+          echo "snapshot_tag=${SNAP}" >> "$GITHUB_OUTPUT"
+          echo "q_hash=${QHASH}" >> "$GITHUB_OUTPUT"
+          echo "w_hash=${WHASH}" >> "$GITHUB_OUTPUT"
+          echo "n_hash=${NHASH}" >> "$GITHUB_OUTPUT"
+          echo "q_file_hash=${QF}" >> "$GITHUB_OUTPUT"
+          echo "w_file_hash=${WF}" >> "$GITHUB_OUTPUT"
+          echo "n_file_hash=${NF}" >> "$GITHUB_OUTPUT"
+          echo "q_state=${QSTATE}" >> "$GITHUB_OUTPUT"
+          echo "w_state=${WSTATE}" >> "$GITHUB_OUTPUT"
+          echo "n_state=${NSTATE}" >> "$GITHUB_OUTPUT"
+          echo "Snapshot: $SNAP"
+
+      - name: Generate checksums for artifacts
+        run: |
+          mkdir -p checksums
+          cd immortalwrt/bin/targets || exit 0
+          find . -type f \( -name "*-squashfs-sysupgrade.img.gz" -o -name "*.manifest" -o -name "profiles.json" -o -name "sha256sums" \) -print0 | while IFS= read -r -d '' f; do
+            sha256sum "$f" >> "$GITHUB_WORKSPACE/checksums/sha256sum.txt" || true
+            md5sum "$f" >> "$GITHUB_WORKSPACE/checksums/md5sum.txt" || true
+          done || true
+          cd "$GITHUB_WORKSPACE"
+
+      - name: Generate release notes
+        run: |
+          mkdir -p logs
+          RN=logs/release_notes.txt
+          echo "ImmortalWrt Build ${{ steps.snapshot.outputs.snapshot_tag }}" > $RN
+          echo "Build date: $(date --iso-8601=seconds)" >> $RN
+          echo "" >> $RN
+          echo "Configuration state:" >> $RN
+          echo " QModem feed hash: ${{ steps.snapshot.outputs.q_hash }} (file hash: ${{ steps.snapshot.outputs.q_file_hash }}) state: ${{ steps.snapshot.outputs.q_state }}" >> $RN
+          echo " Wireless feed hash: ${{ steps.snapshot.outputs.w_hash }} (file hash: ${{ steps.snapshot.outputs.w_file_hash }}) state: ${{ steps.snapshot.outputs.w_state }}" >> $RN
+          echo " Network feed hash: ${{ steps.snapshot.outputs.n_hash }} (file hash: ${{ steps.snapshot.outputs.n_file_hash }}) state: ${{ steps.snapshot.outputs.n_state }}" >> $RN
+          echo "" >> $RN
+          echo "Artifacts:" >> $RN
+          ls -lh immortalwrt/bin/targets || true
+          echo "" >> $RN
+          echo "SHA256 sums (partial):" >> $RN
+          sed -n '1,200p' checksums/sha256sum.txt 2>/dev/null || true
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: immortalwrt-firmware
+          name: immortalwrt-artifacts
           path: |
-            immortalwrt/bin/targets/**/config.buildinfo
-            immortalwrt/bin/targets/**/feeds.buildinfo
             immortalwrt/bin/targets/**/*.manifest
-            immortalwrt/bin/targets/**/*sysupgrade*.img.gz
+            immortalwrt/bin/targets/**/*-squashfs-sysupgrade.img.gz
             immortalwrt/bin/targets/**/profiles.json
             immortalwrt/bin/targets/**/sha256sums
+            config.buildinfo
+            feeds.buildinfo
+            checksums/sha256sum.txt
+            checksums/md5sum.txt
+            logs/release_notes.txt
+
+      - name: Create GitHub Release
+        id: create_release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.snapshot.outputs.snapshot_tag }}
+          name: ImmortalWrt Build ${{ steps.snapshot.outputs.snapshot_tag }}
+          body_path: logs/release_notes.txt
+          draft: false
+          prerelease: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            immortalwrt/bin/targets/**/*.manifest
+            immortalwrt/bin/targets/**/*-squashfs-sysupgrade.img.gz
+            immortalwrt/bin/targets/**/profiles.json
+            immortalwrt/bin/targets/**/sha256sums
+            config.buildinfo
+            feeds.buildinfo
+            logs/release_notes.txt
