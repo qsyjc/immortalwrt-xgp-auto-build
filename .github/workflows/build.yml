@@ -1,120 +1,119 @@
-name: ImmortalWrt Full Build & Release
+name: Build ImmortalWrt
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     env:
-      LANG: C.UTF-8
-      LC_ALL: C.UTF-8
+      DEBIAN_FRONTEND: noninteractive
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+        uses: actions/checkout@v3
 
-      # -------- 构建依赖（你确认过的版本） --------
       - name: Install build dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            ack antlr3 asciidoc autoconf automake autopoint \
-            binutils bison build-essential bzip2 ccache \
-            clang cmake cpio curl device-tree-compiler \
-            ecj fastjar flex gawk gettext gcc-multilib \
-            g++-multilib git gnutls-dev gperf haveged \
-            help2man intltool lib32gcc-s1 libc6-dev-i386 \
-            libelf-dev libglib2.0-dev libgmp3-dev \
-            libltdl-dev libmpc-dev libmpfr-dev \
-            libncurses-dev libpython3-dev \
-            libreadline-dev libssl-dev libtool \
-            libyaml-dev libz-dev lld llvm lrzsz \
-            mkisofs msmtp nano ninja-build \
-            p7zip p7zip-full patch pkgconf \
-            python3 python3-pip python3-ply \
-            python3-pyelftools qemu-utils re2c \
-            rsync scons squashfs-tools subversion \
-            swig texinfo uglifyjs upx-ucl unzip \
-            vim wget xmlto xxd zlib1g-dev zstd
+          chmod +x ./install-env.sh
+          sudo ./install-env.sh
 
-      - name: Ensure build script is executable
-        run: |
-          chmod +x build-immortalwrt.sh
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: 3.11
 
-      - name: Run build script
-        id: build
+      - name: Build ImmortalWrt
         run: |
+          chmod +x ./build-immortalwrt.sh
           ./build-immortalwrt.sh
 
-      - name: Show summary
+      - name: Generate snapshot version with config state
+        id: snapshot
         run: |
-          echo "----- Build summary -----"
-          cat build_summary.txt || true
-          echo "-------------------------"
+          SNAPSHOT_DATE=$(date "+%Y%m%d%H%M")
 
-      - name: Upload artifacts (firmware)
-        if: success()
-        uses: actions/upload-artifact@v4
+          # 获取关键模块 Git Hash
+          QMODEM_HASH=$(git -C feeds/qmodem rev-parse --short HEAD || echo "none")
+          WIFI_HASH=$(git -C package/network/config/wireless rev-parse --short HEAD || echo "none")
+          LAN_HASH=$(git -C package/network/config/network rev-parse --short HEAD || echo "none")
+
+          # 获取配置文件内容哈希
+          QMODEM_FILE_HASH=$(sha256sum feeds/qmodem/application/qmodem/files/etc/config/qmodem | awk '{print $1}' || echo "none")
+          WIFI_FILE_HASH=$(sha256sum package/network/config/wireless/files/etc/config/wireless | awk '{print $1}' || echo "none")
+          LAN_FILE_HASH=$(sha256sum package/network/config/network/files/etc/config/network | awk '{print $1}' || echo "none")
+
+          # 检测配置文件是否有变动
+          QMODEM_STATE=$(git -C feeds/qmodem diff --quiet --exit-code -- application/qmodem/files/etc/config/qmodem && echo "未变动" || echo "已变动")
+          WIFI_STATE=$(git -C package/network/config/wireless diff --quiet --exit-code -- files/etc/config/wireless && echo "未变动" || echo "已变动")
+          LAN_STATE=$(git -C package/network/config/network diff --quiet --exit-code -- files/etc/config/network && echo "未变动" || echo "已变动")
+
+          # 构建 Snapshot Tag
+          SNAPSHOT_TAG="R${SNAPSHOT_DATE}-Q${QMODEM_HASH}-${QMODEM_FILE_HASH}-W${WIFI_HASH}-${WIFI_FILE_HASH}-L${LAN_HASH}-${LAN_FILE_HASH}"
+          echo "snapshot_tag=${SNAPSHOT_TAG}" >> $GITHUB_OUTPUT
+          echo "Snapshot tag: ${SNAPSHOT_TAG}"
+
+      - name: Generate checksum files
+        run: |
+          mkdir -p checksums
+          find immortalwrt/bin/targets -type f \( -name "*.img" -o -name "*.bin" -o -name "*.ipk" \) | while read f; do
+            sha256sum "$f" >> checksums/sha256sum.txt
+            md5sum "$f" >> checksums/md5sum.txt
+          done
+
+      - name: Generate changelog and package size
+        id: changelog
+        run: |
+          mkdir -p logs
+          RELEASE_LOG="logs/release_notes.txt"
+          echo "ImmortalWrt Build ${{ steps.snapshot.outputs.snapshot_tag }}" > $RELEASE_LOG
+          echo "Build date: $(date)" >> $RELEASE_LOG
+          echo "" >> $RELEASE_LOG
+          echo "Generated firmware and packages:" >> $RELEASE_LOG
+          find immortalwrt/bin/targets -type f \( -name "*.img" -o -name "*.bin" -o -name "*.ipk" \) -exec ls -lh {} \; >> $RELEASE_LOG
+          echo "" >> $RELEASE_LOG
+          echo "SHA256 checksums:" >> $RELEASE_LOG
+          cat checksums/sha256sum.txt >> $RELEASE_LOG
+          echo "" >> $RELEASE_LOG
+          echo "MD5 checksums:" >> $RELEASE_LOG
+          cat checksums/md5sum.txt >> $RELEASE_LOG
+          echo "" >> $RELEASE_LOG
+          echo "Configuration file hashes and state:" >> $RELEASE_LOG
+          echo "QModem: $QMODEM_FILE_HASH ($QMODEM_STATE)" >> $RELEASE_LOG
+          echo "WiFi: $WIFI_FILE_HASH ($WIFI_STATE)" >> $RELEASE_LOG
+          echo "LAN: $LAN_FILE_HASH ($LAN_STATE)" >> $RELEASE_LOG
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v3
         with:
-          name: immortalwrt-artifacts
+          name: immortalwrt-firmware
           path: |
-            immortalwrt/bin/targets/**
-            build_summary.txt
-
-      - name: Prepare release metadata
-        if: success()
-        id: meta
-        run: |
-          . ./build_summary.txt
-          DATE_TAG=$(date -u +"%Y%m%d%H%M")
-          SHORT_SHA=$(git rev-parse --short HEAD || echo "nogit")
-          TAG="build-${DATE_TAG}-${SHORT_SHA}-${BUILD_UUID}"
-          echo "tag=${TAG}" >> $GITHUB_OUTPUT
-          echo "name=ImmortalWrt build ${BUILD_REVISION} ${DATE_TAG}" >> $GITHUB_OUTPUT
-          # compute artifact path (pick first bin/targets subdir)
-          ART_DIR=$(ls -d immortalwrt/bin/targets/* 2>/dev/null | head -n1 || true)
-          echo "artifact_dir=${ART_DIR}" >> $GITHUB_OUTPUT
+            immortalwrt/bin/targets/**/*
+            immortalwrt/build_dir/target-*/packages/*.ipk
+            checksums/sha256sum.txt
+            checksums/md5sum.txt
+            logs/release_notes.txt
 
       - name: Create GitHub Release
-        if: success()
+        id: create_release
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: ${{ steps.meta.outputs.tag }}
-          name: ${{ steps.meta.outputs.name }}
-          body: |
-            Auto build from ${{ github.repository }}@${{ github.sha }}
-            Build UUID: ${{ steps.meta.outputs.tag }}
-            Build info:
-            $(cat build_summary.txt || true)
+          tag_name: ${{ steps.snapshot.outputs.snapshot_tag }}
+          name: ImmortalWrt Build ${{ steps.snapshot.outputs.snapshot_tag }}
+          body_path: logs/release_notes.txt
+          draft: false
+          prerelease: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Upload release assets
-        if: success()
-        run: |
-          ART_DIR="${{ steps.meta.outputs.artifact_dir }}"
-          if [ -d "$ART_DIR" ]; then
-            echo "Uploading assets from $ART_DIR"
-            for f in $(find "$ART_DIR" -type f -name "*.bin" -o -name "*.img" -o -name "*.tar" -o -name "*.gz" -o -name "*.ipk" -o -name "*.zip" 2>/dev/null); do
-              echo "Uploading $f"
-              gh release upload "${{ steps.meta.outputs.tag }}" "$f" --clobber || true
-            done
-          else
-            echo "No artifact dir: $ART_DIR"
-          fi
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # gh cli is required; install if not present:
-      - name: Ensure GitHub CLI installed
-        if: success()
-        run: |
-          if ! command -v gh >/dev/null 2>&1; then
-            sudo apt update
-            sudo apt install -y gh
-          fi
+      - name: Upload Release Assets
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            immortalwrt/bin/targets/**/*.img
+            immortalwrt/bin/targets/**/*.bin
+            immortalwrt/bin/targets/**/*.ipk
+            checksums/sha256sum.txt
+            checksums/md5sum.txt
