@@ -1,4 +1,4 @@
-name: ImmortalWrt Build
+name: Build ImmortalWrt
 
 on:
   workflow_dispatch:
@@ -13,20 +13,17 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v4
-        with:
-          python-version: "3.11"
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Install dependencies
         run: |
-          chmod +x ./install-env.sh
-          sudo ./install-env.sh
+          chmod +x install-env.sh
+          ./install-env.sh
 
       - name: Build ImmortalWrt
         run: |
-          chmod +x ./build-immortalwrt.sh
+          chmod +x build-immortalwrt.sh
           ./build-immortalwrt.sh
 
       - name: Upload firmware
@@ -37,6 +34,6 @@ jobs:
             immortalwrt/bin/targets/**/config.buildinfo
             immortalwrt/bin/targets/**/feeds.buildinfo
             immortalwrt/bin/targets/**/*.manifest
-            immortalwrt/bin/targets/**/*.img.gz
+            immortalwrt/bin/targets/**/*sysupgrade*.img.gz
             immortalwrt/bin/targets/**/profiles.json
             immortalwrt/bin/targets/**/sha256sums
