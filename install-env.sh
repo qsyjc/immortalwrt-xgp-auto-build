@@ -1,19 +1,23 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
 export DEBIAN_FRONTEND=noninteractive
 
-apt-get update -y
+echo "[+] Update apt"
+sudo apt-get update -y
 
-apt-get install -y \
-  ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential \
-  bzip2 ccache clang cmake cpio curl device-tree-compiler ecj fastjar flex gawk gettext \
-  gcc-multilib g++-multilib git gnutls-dev gperf haveged help2man intltool \
-  lib32gcc-s1 libc6-dev-i386 libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev \
-  libmpc-dev libmpfr-dev libncurses-dev libpython3-dev libreadline-dev \
-  libssl-dev libtool libyaml-dev libz-dev lld llvm lrzsz mkisofs msmtp nano \
-  ninja-build p7zip p7zip-full patch pkgconf python3 python3-pip python3-ply \
-  python3-pyelftools qemu-utils re2c rsync scons squashfs-tools subversion \
-  swig texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev zstd
+echo "[+] Installing packages (this may take some minutes)..."
+sudo apt-get install -y \
+  ack antlr3 asciidoc autoconf automake autopoint \
+  binutils bison build-essential bzip2 ccache clang cmake \
+  cpio curl device-tree-compiler ecj fastjar flex gawk gettext \
+  gcc-multilib g++-multilib git gnutls-dev gperf haveged help2man \
+  intltool libc6-dev-i386 libelf-dev libglib2.0-dev libgmp3-dev \
+  libltdl-dev libmpc-dev libmpfr-dev libncurses-dev libpython3-dev \
+  libreadline-dev libssl-dev libtool libyaml-dev libz-dev lld llvm \
+  lrzsz mkisofs msmtp nano ninja-build p7zip p7zip-full patch pkgconf \
+  python3 python3-pip python3-ply python3-pyelftools qemu-utils re2c \
+  rsync scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl \
+  unzip vim wget xmlto xxd zlib1g-dev zstd uuid-runtime
 
-echo "[✓] Build environment ready"
+echo "[✓] Dependencies installed"
