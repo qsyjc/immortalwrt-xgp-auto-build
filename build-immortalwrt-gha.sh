@@ -1,147 +1,186 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -e
+set -o pipefail
 
-echo "🚀 ImmortalWrt GHA Build"
+# -----------------------------
+# 工作目录和日志
+# -----------------------------
+ROOT_DIR="$PWD"
+IW_DIR="$ROOT_DIR/immortalwrt"
+BUILD_LOG="$ROOT_DIR/immortalwrt-build.log"
 
-WORKDIR="$(pwd)"
-LOG="$WORKDIR/immortalwrt-build.log"
-exec > >(tee "$LOG") 2>&1
+echo "🚀 ImmortalWrt GHA Full Build"
+echo "📁 Workdir: $ROOT_DIR"
+echo "🧾 Log: $BUILD_LOG"
 
-REPO_URL="https://github.com/immortalwrt/immortalwrt.git"
-REPO_DIR="immortalwrt"
-
-echo "📁 Workdir: $WORKDIR"
-
-###############################################################################
-# 1️⃣ 获取 ImmortalWrt 本体（区分 GHA / 本地）
-###############################################################################
-if [ -n "$GITHUB_ACTIONS" ]; then
-  echo "🔧 GitHub Actions mode"
-  if [ ! -d "$REPO_DIR" ]; then
-    echo "❌ GHA mode requires immortalwrt/ to exist (repo layout error)"
-    exit 1
-  fi
+# -----------------------------
+# 1️⃣ 获取 / 更新源码
+# -----------------------------
+if [ ! -d "$IW_DIR/.git" ]; then
+    echo "[+] Clone ImmortalWrt"
+    git clone https://github.com/immortalwrt/immortalwrt.git "$IW_DIR"
 else
-  echo "🔧 Local mode"
-  if [ ! -d "$REPO_DIR/.git" ]; then
-    echo "[+] clone immortalwrt"
-    git clone --depth=1 "$REPO_URL" "$REPO_DIR"
-  else
-    echo "[+] update immortalwrt"
-    cd "$REPO_DIR"
-    git reset --hard
-    git clean -fd
-    git pull --ff-only || true
-    cd ..
-  fi
+    echo "[+] Update ImmortalWrt"
+    cd "$IW_DIR"
+    if [ -n "$(git status --porcelain)" ]; then
+        echo "[!] Local changes detected, auto stash"
+        git stash save "auto-stash-before-build"
+        git pull --rebase
+        git stash pop || true
+    else
+        git pull --rebase
+    fi
 fi
 
-cd "$REPO_DIR"
+cd "$IW_DIR"
 
-###############################################################################
-# 2️⃣ feeds
-###############################################################################
-echo "📦 update feeds"
+# -----------------------------
+# 2️⃣ feeds + QModem
+# -----------------------------
+grep -q "src-git qmodem" feeds.conf.default || \
+echo "src-git qmodem https://github.com/FUjr/QModem.git;main" >> feeds.conf.default
+
+echo "[+] Update all feeds"
 ./scripts/feeds update -a
 ./scripts/feeds install -a
 
-###############################################################################
-# 3️⃣ QModem feed
-###############################################################################
-if ! grep -q "^src-git qmodem " feeds.conf.default; then
-  echo "src-git qmodem https://github.com/FUjr/QModem.git;main" >> feeds.conf.default
-fi
-
+echo "[+] Update QModem feed"
 ./scripts/feeds update qmodem
+./scripts/feeds install -a -p qmodem
 ./scripts/feeds install -a -f -p qmodem
 
-###############################################################################
-# 4️⃣ 自定义插件（存在就更新，不在就 clone）
-###############################################################################
+# -----------------------------
+# 3️⃣ 检测屏幕驱动插件
+# -----------------------------
 mkdir -p package/zz
+for pkg in kmod-fb-tft-gc9307 xgp-v3-screen; do
+    if [ ! -d "package/zz/$pkg/.git" ]; then
+        echo "[+] Clone $pkg"
+        git clone https://github.com/zzzz0317/$pkg.git package/zz/$pkg
+    else
+        echo "[=] Update package/zz/$pkg"
+        cd package/zz/$pkg && git pull && cd -
+    fi
+done
 
-clone_or_update() {
-  local url="$1"
-  local dir="$2"
+# -----------------------------
+# 4️⃣ 准备 files 目录
+# -----------------------------
+mkdir -p files/etc \
+         files/etc/config \
+         files/etc/uci-defaults \
+         files/etc/udev/rules.d
 
-  if [ ! -d "$dir/.git" ]; then
-    echo "[+] clone $dir"
-    git clone --depth=1 "$url" "$dir"
-  else
-    echo "[=] update $dir"
-    git -C "$dir" reset --hard || true
-    git -C "$dir" pull --ff-only || true
-  fi
-}
+# -----------------------------
+# 5️⃣ QModem 默认配置 + 保留升级
+# -----------------------------
+cp feeds/qmodem/application/qmodem/files/etc/config/qmodem files/etc/config/qmodem
+echo '/etc/config/qmodem' >> files/etc/sysupgrade.conf
 
-clone_or_update https://github.com/zzzz0317/kmod-fb-tft-gc9307.git package/zz/kmod-fb-tft-gc9307
-clone_or_update https://github.com/zzzz0317/xgp-v3-screen.git        package/zz/xgp-v3-screen
-clone_or_update https://github.com/asvow/luci-app-tailscale.git     package/luci-app-tailscale
-clone_or_update https://github.com/EasyTier/luci-app-easytier.git   package/luci-app-easytier
-clone_or_update https://github.com/sirpdboy/luci-app-lucky.git      package/lucky
-
-###############################################################################
-# 5️⃣ 修 tailscale Makefile
-###############################################################################
-sed -i '/\/etc\/init\.d\/tailscale/d;/\/etc\/config\/tailscale/d;' \
-  feeds/packages/net/tailscale/Makefile || true
-
-###############################################################################
-# 6️⃣ 生成 files 目录
-###############################################################################
-mkdir -p files/etc/uci-defaults
-mkdir -p files/etc/config
-
-###############################################################################
-# 7️⃣ WiFi 默认配置（US / 固定密码）
-###############################################################################
-cat > files/etc/uci-defaults/99-wifi <<'EOF'
-#!/bin/sh
-uci set wireless.@wifi-device[0].country='US'
-uci set wireless.@wifi-iface[0].encryption='psk2'
-uci set wireless.@wifi-iface[0].key='88888888'
-uci commit wireless
+cat >> files/etc/config/qmodem <<'EOF'
+config global
+	option keep_config '1'
 EOF
-chmod +x files/etc/uci-defaults/99-wifi
 
-###############################################################################
-# 8️⃣ 使用 xgp.config
-###############################################################################
-if [ ! -f "$WORKDIR/xgp.config" ]; then
-  echo "❌ xgp.config not found in repo root"
-  exit 1
+# -----------------------------
+# 6️⃣ 首次启动初始化 LAN/WiFi/UI
+# -----------------------------
+cat > files/etc/uci-defaults/99-firstboot <<'EOF'
+#!/bin/sh
+uci set system.@system[0].hostname='zzXGP'
+uci commit system
+
+uci set network.lan.ipaddr='10.0.11.1'
+uci commit network
+
+for radio in $(uci show wireless | grep "=wifi-device" | cut -d. -f2 | cut -d= -f1); do
+    uci set wireless.$radio.country='US'
+    idx=$(echo $radio | tr -cd 0-9)
+    iface="default_radio$idx"
+    uci set wireless.$iface.ssid='zzXGP'
+    uci set wireless.$iface.encryption='psk2+ccmp'
+    uci set wireless.$iface.key='xgpxgpxgp'
+done
+uci commit wireless
+
+uci set luci.main.lang='zh_cn'
+uci set luci.main.mediaurlbase='/luci-static/argon'
+uci commit luci
+exit 0
+EOF
+chmod +x files/etc/uci-defaults/99-firstboot
+
+# -----------------------------
+# 7️⃣ QModem 热插 USB/PCIe + mwan3 自动策略
+# -----------------------------
+# udev 规则
+cat > files/etc/udev/rules.d/99-qmodem-hotplug.rules <<'EOF'
+SUBSYSTEM=="usb", ACTION=="add", RUN+="/etc/qmodem-hotplug.sh add %p"
+SUBSYSTEM=="usb", ACTION=="remove", RUN+="/etc/qmodem-hotplug.sh remove %p"
+EOF
+
+# 热插 shell 脚本
+cat > files/etc/qmodem-hotplug.sh <<'EOF'
+#!/bin/sh
+action=$1
+path=$2
+
+if [ "$action" = "add" ]; then
+    [ -f "$path/idVendor" ] || exit 0
+    uci add qmodem modem-slot
+    uci set qmodem.@modem[-1].type='usb_auto'
+    uci set qmodem.@modem[-1].slot="$path"
+    uci set qmodem.@modem[-1].alias="$(basename $path)"
+    uci commit qmodem
+
+    # mwan3 自动注册接口
+    iface="wan_$(basename $path)"
+    uci set network.$iface=interface
+    uci set network.$iface.proto='dhcp'
+    uci set network.$iface.ifname="$path"
+    uci set network.$iface.enabled='1'
+    uci commit network
+    uci commit mwan3
+elif [ "$action" = "remove" ]; then
+    # 可扩展删除逻辑
+    exit 0
+fi
+EOF
+chmod +x files/etc/qmodem-hotplug.sh
+
+# -----------------------------
+# 8️⃣ 应用 .config 或 defconfig
+# -----------------------------
+if [ -f "$ROOT_DIR/xgp.config" ]; then
+    cp "$ROOT_DIR/xgp.config" .config
+elif [ ! -f ".config" ]; then
+    echo "[!] No config found, generate default defconfig"
+    make defconfig
 fi
 
-cp "$WORKDIR/xgp.config" .config
-make defconfig
+# -----------------------------
+# 9️⃣ download + build
+# -----------------------------
+set +e
+make download -j$(nproc) V=s 2>&1 | tee "$BUILD_LOG"
+make -j$(nproc) V=s 2>&1 | tee -a "$BUILD_LOG"
+RET=$?
+set -e
 
-###############################################################################
-# 9️⃣ 下载源码
-###############################################################################
-make download -j$(nproc)
-
-###############################################################################
-# 🔟 编译（失败 → 打印第一个 error）
-###############################################################################
-echo "🔥 building firmware..."
-if ! make -j$(nproc); then
-  echo "❌ BUILD FAILED"
-  echo "🔍 First error:"
-  grep -n -E " error:|^make\[" "$LOG" | head -n 1 || true
-  exit 1
+if [ $RET -ne 0 ]; then
+    echo "❌ BUILD FAILED"
+    grep -n "error:" "$BUILD_LOG" | head -n 1
+    exit 1
 fi
 
 echo "✅ BUILD SUCCESS"
 
-###############################################################################
-# 1️⃣1️⃣ 输出产物（rockchip / xgp 兜底）
-###############################################################################
-OUTDIR="bin/targets"
-
-if [ ! -d "$OUTDIR" ]; then
-  echo "❌ No target output directory"
-  exit 1
+# -----------------------------
+# 10️⃣ 打包 bin 路径检查
+# -----------------------------
+BIN_DIR="$IW_DIR/bin/targets/rockchip/armv8"
+if [ -d "$BIN_DIR" ]; then
+    echo "[+] Build artifacts at $BIN_DIR"
+else
+    echo "[!] Build output not found"
 fi
-
-echo "📦 Firmware images:"
-find "$OUTDIR" -type f -name "*sysupgrade*.img*" -ls || true
