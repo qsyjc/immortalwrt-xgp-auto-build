@@ -3,10 +3,13 @@ name: ImmortalWrt XGP Build & Release
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 18 * * 4'
+    - cron: '0 18 * * *'
+  push:
+    tags:
+      - 'v*'
 
 permissions:
-  contents: write   # 👈 创建 Release 必须
+  contents: write
 
 jobs:
   build:
@@ -15,103 +18,76 @@ jobs:
       TZ: Asia/Shanghai
 
     steps:
-      - name: Show system info
-        run: |
-          df -h
-          free -h
-          nproc
-
-      - name: Maximize build space
-        uses: easimon/maximize-build-space@master
-        with:
-          root-reserve-mb: 10240
-          swap-size-mb: 1024
-          remove-dotnet: 'false'
-
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          fetch-depth: 0   # 👈 必须，为了 git log
 
-      - name: Debug workspace
+      - name: Determine channel
         run: |
-          pwd
-          ls -lah
-          test -f build-immortalwrt-gha.sh
-
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            ack antlr3 asciidoc autoconf automake autopoint \
-            binutils bison build-essential \
-            bzip2 ccache clang cmake cpio curl \
-            device-tree-compiler ecj fastjar flex gawk gettext \
-            gcc-multilib g++-multilib git gnutls-dev gperf \
-            haveged help2man intltool \
-            lib32gcc-s1 libc6-dev-i386 libelf-dev \
-            libglib2.0-dev libgmp3-dev libltdl-dev \
-            libmpc-dev libmpfr-dev libncurses-dev \
-            libpython3-dev libreadline-dev libssl-dev \
-            libtool libyaml-dev libz-dev \
-            lld llvm lrzsz mkisofs msmtp nano \
-            ninja-build p7zip p7zip-full patch pkgconf \
-            python3 python3-pip python3-ply python3-pyelftools \
-            qemu-utils re2c rsync scons squashfs-tools \
-            subversion swig texinfo uglifyjs upx-ucl \
-            unzip vim wget xmlto xxd \
-            zlib1g-dev zstd
-
-      - name: Cache dl & staging_dir
-        uses: actions/cache@v4
-        with:
-          path: |
-            immortalwrt/dl
-            immortalwrt/staging_dir
-          key: ${{ runner.os }}-immortalwrt-${{ hashFiles('xgp.config') }}
-
-      - name: Build ImmortalWrt (capture log)
-        shell: bash
-        run: |
-          set -o pipefail
-          chmod +x build-immortalwrt-gha.sh
-          ./build-immortalwrt-gha.sh 2>&1 | tee build.log || true
-
-          if grep -n -E "error: .*failed|^make.*Error|^ERROR:" build.log; then
-            echo "❌ Build failed, first error:"
-            grep -n -E "error: .*failed|^make.*Error|^ERROR:" build.log | head -n 1
-            exit 1
+          if [[ "${{ github.event_name }}" == "schedule" ]]; then
+            echo "CHANNEL=nightly" >> $GITHUB_ENV
+          else
+            echo "CHANNEL=stable" >> $GITHUB_ENV
           fi
 
-      - name: Rename firmware
-        if: success()
+      - name: Build
+        run: |
+          chmod +x build-immortalwrt-gha.sh
+          ./build-immortalwrt-gha.sh
+
+      - name: Prepare firmware & metadata
         run: |
           set -e
-          cd immortalwrt/bin/targets/rockchip/armv8
+          cd immortalwrt
 
+          KERNEL=$(grep -R "LINUX_VERSION-" include | head -n1 | sed 's/.*=//')
+          GITHASH=$(git rev-parse --short HEAD)
           DATE=$(date +%Y%m%d)
-          TIME=$(date +%H%M)
-          PREFIX="ImmortalWrt-XGP-v3-${DATE}-${TIME}"
+
+          OUT=bin/targets/rockchip/armv8
+          PREFIX="ImmortalWrt-XGP-v3-${KERNEL}-g${GITHASH}-${DATE}"
+
+          cd $OUT
 
           for f in *sysupgrade*.img.gz; do
             mv "$f" "${PREFIX}-sysupgrade.img.gz"
           done
 
+          sha256sum *.img.gz > sha256sums
+
           ls -lah
 
-      - name: Create GitHub Release
-        if: success()
+      - name: Generate driver changelog
+        run: |
+          set -e
+          LAST_TAG=$(git tag --sort=-creatordate | head -n1)
+
+          if [ -z "$LAST_TAG" ]; then
+            echo "### 驱动 / QModem 变更" > driver.log
+            echo "首次构建，无历史记录。" >> driver.log
+          else
+            echo "### 驱动 / QModem 变更" > driver.log
+            git log ${LAST_TAG}..HEAD \
+              -- package/qmodem package/network target/linux/rockchip \
+              --oneline >> driver.log || echo "无变更记录" >> driver.log
+          fi
+
+          cat driver.log
+
+      - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: build-${{ github.run_number }}
-          name: ImmortalWrt XGP 自动构建 #${{ github.run_number }}
+          tag_name: ${{ env.CHANNEL }}-${{ github.run_number }}
+          name: ImmortalWrt XGP ${{ env.CHANNEL }} 构建
           body: |
-            ✅ ImmortalWrt XGP 自动编译完成
+            ✅ 编译通道：${{ env.CHANNEL }}
+            ✅ Kernel：已集成
+            ✅ Git：${{ github.sha }}
 
-            - 构建时间：${{ github.run_started_at }}
-            - 分支：${{ github.ref_name }}
-            - Commit：${{ github.sha }}
-
-            固件已通过 GitHub Actions 自动编译并上传。
+            $(cat driver.log)
           files: |
             immortalwrt/bin/targets/rockchip/armv8/*.img.gz
+            immortalwrt/bin/targets/rockchip/armv8/sha256sums
+            immortalwrt/bin/targets/rockchip/armv8/manifest
+            immortalwrt/bin/targets/rockchip/armv8/config.buildinfo
