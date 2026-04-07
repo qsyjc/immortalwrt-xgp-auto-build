@@ -81,3 +81,19 @@ echo "Fix Rust build remove CI LLVM download"
 if [ -f "feeds/packages/lang/rust/Makefile" ]; then
     sed -i 's/download-ci-llvm=true/download-ci-llvm=false/g' "feeds/packages/lang/rust/Makefile"
 fi
+
+# echo "Fix Rust build remove CI LLVM download"
+# if [ -f "feeds/packages/lang/rust/Makefile" ]; then
+#     sed -i 's/download-ci-llvm=true/download-ci-llvm=false/g' "feeds/packages/lang/rust/Makefile"
+# fi
+
+# 1. 清理可能存在的重复包 (防止编译冲突)
+rm -rf feeds/luci/applications/luci-app-lucky
+rm -rf feeds/luci/applications/luci-app-easytier
+rm -rf feeds/luci/applications/luci-app-adguardhome
+
+# 2. 克隆插件 (增加 --depth=1 加速编译)
+echo "Cloning custom packages..."
+git clone --depth=1 https://github.com/gdy666/luci-app-lucky.git package/lucky
+git clone --depth=1 https://github.com/EasyTier/luci-app-easytier.git package/luci-app-easytier
+git clone --depth=1 https://github.com/rufengsuixing/luci-app-adguardhome.git package/luci-app-adguardhome
