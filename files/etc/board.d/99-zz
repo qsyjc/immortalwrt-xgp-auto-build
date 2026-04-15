@@ -2,8 +2,8 @@
 
 board_config_update
 
-ucidef_set_hostname "WiFi-001"
-ucidef_set_root_password_plain "xgpxgpxgp"
+ucidef_set_hostname "WzWrt"
+ucidef_set_root_password_plain "123456789"
 ucidef_set_country "CN"
 ucidef_set_wireless "all" "WiFi-01" "psk2+ccmp" "xgpxgpxgp"
 
